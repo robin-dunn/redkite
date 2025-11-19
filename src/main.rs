@@ -1,20 +1,23 @@
 use hyper::{
-    Body, Client, Request, Response, Server, Uri,
+    Body, Client, Request, Response, Server,
     service::{make_service_fn, service_fn},
 };
+use hyper::body::to_bytes;
+use hyper_tls::HttpsConnector;
 use std::convert::Infallible;
 
 async fn proxy(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-    // Extract what we need BEFORE moving req
+    // Extract necessary info before moving req
     let original_headers = req.headers().clone();
     let method = req.method().clone();
+    let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
     let host = original_headers
         .get("host")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("<missing>");
 
-    // Prevent recursive forwarding to self
+    // Prevent infinite recursion
     if host == "localhost:3000" || host == "127.0.0.1:3000" {
         return Ok(Response::builder()
             .status(400)
@@ -22,30 +25,40 @@ async fn proxy(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
             .unwrap());
     }
 
-    let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-    // --- Minimal logging ---
     println!("--> {} http://{}{}", method, host, path);
 
-    // Build outgoing URL
-    let uri_str = format!("http://{}{}", host, path);
-    let uri: Uri = uri_str.parse().unwrap();
+    // Determine scheme: default to https
+    let scheme = if path.starts_with("http://") || path.starts_with("https://") {
+        ""
+    } else {
+        "https://"
+    };
 
-    // Now we can consume the body safely
-    let body = req.into_body();
+    let uri: hyper::Uri = format!("{}{}{}", scheme, host, path).parse().unwrap();
 
-    // Build new request
+    // Build outgoing request
     let mut new_req = Request::builder()
         .method(method)
         .uri(uri)
-        .body(body)
+        .body(req.into_body())
         .unwrap();
 
     *new_req.headers_mut() = original_headers;
 
-    // Forward using the Hyper client
-    let client = Client::new();
-    client.request(new_req).await
+    // HTTPS client
+    let https = HttpsConnector::new();
+    let client = Client::builder().build::<_, Body>(https);
+
+    // Send request
+    let resp = client.request(new_req).await?;
+
+    // Log response body (small responses only)
+    let (parts, body) = resp.into_parts();
+    let body_bytes = to_bytes(body).await?;
+    println!("<-- Response body: {}", String::from_utf8_lossy(&body_bytes));
+
+    // Reconstruct response for client
+    Ok(Response::from_parts(parts, Body::from(body_bytes)))
 }
 
 #[tokio::main]
